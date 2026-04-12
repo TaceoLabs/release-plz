@@ -771,8 +771,15 @@ publish = true
 #[cfg_attr(not(feature = "docker-tests"), ignore)]
 async fn git_only_release_creates_tag() {
     use cargo_metadata::semver::Version;
+    use cargo_utils::LocalManifest;
 
     let context = TestContext::new().await;
+
+    // Git-only releases must include crates that Cargo itself marks as unpublished.
+    let cargo_toml_path = context.repo_dir().join("Cargo.toml");
+    let mut cargo_toml = LocalManifest::try_new(&cargo_toml_path).unwrap();
+    cargo_toml.data["package"]["publish"] = false.into();
+    cargo_toml.write().unwrap();
 
     // Configure with git_only = true and publish = false
     let config = r#"
@@ -1085,6 +1092,73 @@ This PR was generated with [release-plz](https://github.com/release-plz/release-
         .trim(),
         pr_body.trim()
     );
+}
+
+#[tokio::test]
+#[cfg_attr(not(feature = "docker-tests"), ignore)]
+async fn git_only_update_reuses_source_fallback_for_packages_sharing_a_release_tag() {
+    use cargo_utils::LocalManifest;
+
+    let context = TestContext::new_workspace_with_packages(&[
+        TestPackage::new("mylib-a").with_type(PackageType::Lib),
+        TestPackage::new("mylib-b").with_type(PackageType::Lib),
+        TestPackage::new("mybin")
+            .with_type(PackageType::Bin)
+            .with_path_dependencies(vec!["../mylib-a", "../mylib-b"]),
+    ])
+    .await;
+
+    // Cargo refuses to package path dependencies without version requirements.
+    let manifest_path = context.package_path("mybin").join("Cargo.toml");
+    let mut manifest = LocalManifest::try_new(&manifest_path).unwrap();
+    for dependency in ["mylib-a", "mylib-b"] {
+        manifest.data["dependencies"][dependency]
+            .as_inline_table_mut()
+            .unwrap()
+            .remove("version");
+    }
+    manifest.write().unwrap();
+
+    let config = r#"
+[workspace]
+git_only = true
+publish = false
+git_tag_name = "v{{ version }}"
+"#;
+    context.write_release_plz_toml(config);
+    context
+        .repo
+        .tag("v0.1.0", "Release workspace v0.1.0")
+        .unwrap();
+
+    let readme = context.package_path("mybin").join("README.md");
+    fs_err::write(&readme, "# Updated README").unwrap();
+    context.push_all_changes("fix: update mybin readme");
+
+    let outcome = context
+        .run_release_pr_with_log("DEBUG,hyper=INFO")
+        .success();
+    let stderr = String::from_utf8_lossy(&outcome.get_output().stderr);
+    assert_eq!(
+        stderr
+            .matches("Run `cargo package --allow-dirty --workspace`")
+            .count(),
+        1,
+        "packages at one historical commit should share one packaging attempt\n{stderr}"
+    );
+    assert_eq!(
+        stderr
+            .matches("falling back to source directory comparison")
+            .count(),
+        1,
+        "the cached workspace should select the source fallback once\n{stderr}"
+    );
+
+    let opened_prs = context.opened_release_prs().await;
+    assert_eq!(opened_prs.len(), 1);
+    let pr_body = opened_prs[0].body.as_ref().expect("PR should have body");
+    assert!(pr_body.contains("`mybin`: 0.1.0 -> 0.1.1"));
+    assert!(pr_body.contains("update mybin readme"));
 }
 
 #[tokio::test]

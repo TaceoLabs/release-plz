@@ -64,6 +64,11 @@ impl ReleaseMetadataBuilder for UpdateRequest {
     }
 }
 
+struct ReconstructedWorkspace {
+    worktree: GitWorkTree,
+    cargo_package_succeeded: bool,
+}
+
 /// Create a temporary worktree and its associated repo.
 ///
 /// If using the CLI, working in a worktree is the same as working in a repo, but in git2 they are
@@ -98,7 +103,7 @@ fn process_git_only_package(
     unreleased_project_repo: &mut GitRepo,
     input: &UpdateRequest,
     is_multi_package: bool,
-    reconstructed_workspaces: &mut BTreeMap<String, GitWorkTree>,
+    reconstructed_workspaces: &mut BTreeMap<String, ReconstructedWorkspace>,
 ) -> anyhow::Result<Option<RegistryPackage>> {
     // Get the release tag template, falling back to default based on project structure
     let template = input
@@ -134,10 +139,10 @@ fn process_git_only_package(
         .get_tag_commit(&release_tag)
         .context("get release tag commit")?;
 
-    let worktree = match reconstructed_workspaces.entry(release_commit.clone()) {
+    let reconstructed_workspace = match reconstructed_workspaces.entry(release_commit.clone()) {
         Entry::Occupied(entry) => {
             debug!(
-                "Reusing packaged workspace at commit {release_commit} for package {}",
+                "Reusing reconstructed workspace at commit {release_commit} for package {}",
                 package.name
             );
             entry.into_mut()
@@ -151,21 +156,47 @@ fn process_git_only_package(
                 .context("checkout release commit for package")?;
 
             // Package and verify the whole workspace so unpublished path dependencies are
-            // materialized in Cargo's temporary local registry.
-            run_cargo_package(&worktree).context("run cargo package")?;
-            entry.insert(worktree)
+            // materialized in Cargo's temporary local registry. Packaging can fail when an
+            // internal path dependency has no version requirement. In that case, retain the
+            // worktree and compare package sources directly.
+            let cargo_package_succeeded = match run_cargo_package(&worktree) {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(
+                        "cargo package failed in git_only mode for package {}, \
+                         falling back to source directory comparison: {error:#}",
+                        package.name
+                    );
+                    false
+                }
+            };
+            entry.insert(ReconstructedWorkspace {
+                worktree,
+                cargo_package_succeeded,
+            })
         }
     };
 
     // Metadata paths point into the cached worktree. Any error aborts collection and drops
     // all reconstructed workspaces, so an unusable artifact cannot be reused.
-    let single_package = get_cargo_package(worktree, &package.name).with_context(|| {
-        format!(
-            "get cargo package {} from worktree at {:?}",
-            package.name,
-            worktree.path()
-        )
-    })?;
+    let single_package = if reconstructed_workspace.cargo_package_succeeded {
+        get_cargo_package(&reconstructed_workspace.worktree, &package.name).with_context(|| {
+            format!(
+                "get cargo package {} from worktree at {:?}",
+                package.name,
+                reconstructed_workspace.worktree.path()
+            )
+        })?
+    } else {
+        get_cargo_package_from_source(&reconstructed_workspace.worktree, &package.name)
+            .with_context(|| {
+                format!(
+                    "get cargo package {} from source at {:?}",
+                    package.name,
+                    reconstructed_workspace.worktree.path()
+                )
+            })?
+    };
 
     let registry_package = RegistryPackage::new(single_package, Some(release_commit));
     Ok(Some(registry_package))
@@ -231,6 +262,42 @@ fn get_cargo_package(worktree: &GitWorkTree, package_name: &str) -> anyhow::Resu
         .clone();
 
     Ok(single_package)
+}
+
+/// Fallback: read package metadata directly from the worktree source (no `cargo package`).
+///
+/// Used when `run_cargo_package` fails (e.g. for monorepos with path dependencies
+/// whose versions cannot be resolved through the registry). The returned `Package`
+/// points to the source directory rather than a `target/package/<name>-<version>/`
+/// tarball — `package_compare::are_packages_equal` handles this via the source-
+/// directory fallback in `get_cargo_package_files`.
+fn get_cargo_package_from_source(
+    worktree: &GitWorkTree,
+    package_name: &str,
+) -> anyhow::Result<Package> {
+    let worktree_path = to_utf8_path(worktree.path())?;
+    let manifest_path = worktree_path.join("Cargo.toml");
+
+    let target_dir = worktree_path.join("target");
+    let mut command = cargo_utils::cargo_metadata_command();
+    let metadata = command
+        .current_dir(worktree_path.as_std_path())
+        .env("CARGO_TARGET_DIR", target_dir)
+        .no_deps()
+        .manifest_path(&manifest_path)
+        .exec()
+        .context("get cargo metadata for worktree")?;
+
+    let package = metadata
+        .workspace_packages()
+        .into_iter()
+        .find(|p| p.name == package_name)
+        .with_context(|| {
+            format!("package {package_name:?} not found in workspace at {worktree_path:?}")
+        })?
+        .clone();
+
+    Ok(package)
 }
 
 /// Determine next version of packages.
@@ -332,7 +399,7 @@ fn collect_git_only_packages(
     // See the note on the custom worktree Drop impl for more details.
     // Packages released at the same commit share one reconstructed workspace: all other
     // reconstruction inputs (repository, manifest, Cargo config) are fixed for this invocation.
-    let mut reconstructed_workspaces: BTreeMap<String, GitWorkTree> = BTreeMap::new();
+    let mut reconstructed_workspaces: BTreeMap<String, ReconstructedWorkspace> = BTreeMap::new();
 
     let mut unreleased_project_repo = GitRepo::open(
         input
@@ -355,7 +422,10 @@ fn collect_git_only_packages(
 
     Ok((
         all_packages,
-        reconstructed_workspaces.into_values().collect(),
+        reconstructed_workspaces
+            .into_values()
+            .map(|workspace| workspace.worktree)
+            .collect(),
     ))
 }
 
