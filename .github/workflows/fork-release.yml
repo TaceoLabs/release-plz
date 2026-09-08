@@ -1,0 +1,46 @@
+name: Fork release
+
+# Creates a GitHub release in the TaceoLabs fork. Publishing the release
+# triggers cd.yml, which builds and uploads the release-plz binaries.
+# The release is created with a GitHub App token because releases created
+# with GITHUB_TOKEN do not trigger other workflows.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, e.g. release-plz-v0.3.162-taceo.1"
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  create-release:
+    name: Create release
+    runs-on: ubuntu-24.04
+    if: github.repository_owner == 'TaceoLabs'
+    permissions:
+      contents: read
+    steps:
+      - name: Generate GitHub App token
+        id: generate-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.RELEASE_PLZ_APP_ID }}
+          private-key: ${{ secrets.RELEASE_PLZ_APP_PRIVATE_KEY }}
+          permission-contents: write
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          case "$TAG" in
+            release-plz-v*) ;;
+            *) echo "tag must start with 'release-plz-v'"; exit 1 ;;
+          esac
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --notes "Upstream release-plz plus unmerged TaceoLabs fixes."
